@@ -2,8 +2,8 @@
 from pyspark.sql import DataFrame
 from pyspark.sql import types as T
 
-from .enums import CheckedData
-from .exceptions import SchemaMismatchError
+from ..enums import CheckedData
+from ..exceptions import SchemaMismatchError
 from .versions import VERSION_COL
 
 

@@ -6,29 +6,39 @@ and open questions so work can continue without the original conversation.
 
 ## Files
 
-- `schema_migrations/` — the library package (PySpark only, Python 3.12 syntax)
-  - `migrations.py` — `Migration` (runs itself via `apply`) and `Migrations`: public API
-    on top (`prepare`, `migrated`, `dry_run`), private building blocks
-    below (`_check_previous`, `_upgrade`, `_stamp`, `_latest`, `_baseline`, `_current_version`, `_upgrade`). Everything
-    not in the README's usage is private (`_` prefix).
-  - `versions.py` — `VERSION_COL`, `VersionStats` (one aggregation over the previous
-    output), `_rows_per_version` (only for the mixed-versions error)
-  - `schema.py` — `check_schema` (names + types, nullability ignored)
-  - `protocols.py` — `TransformOutput` Protocol (the parts of Foundry's output the library
-    calls; `transforms.api` isn't available locally), `WriteOptions`
+- `schema_migrations/` — the library package (PySpark only, Python 3.12 syntax). Users
+  copy this folder into their Foundry repo.
+  - `__init__.py` — re-exports the public names
   - `enums.py` — `CheckedData` (which data failed a schema check), `WriteMode`
   - `exceptions.py` — `MigrationError` and one subclass per failure, each building its
     own message and keeping the relevant values as attributes
-  - `__init__.py` — re-exports the public names
-- `test_schema_migrations.py` — pytest suite, runs on local Spark with fake Foundry objects
+  - `core/` — plain Spark
+    - `migration.py` — `Migration` (one schema change; runs itself via `_apply`)
+    - `migrations.py` — `Migrations` (the chain): public `prepare`, `migrated`, `dry_run`;
+      private `_current_version`, `_upgrade`, `_check_previous`, `_stamp`, `_latest`,
+      `_baseline`
+    - `versions.py` — `VERSION_COL`, `VersionStats` (one aggregation over the previous
+      output), `_rows_per_version` (only for the mixed-versions error)
+    - `schema.py` — `check_schema` (names + types, nullability ignored)
+    - `decorators.py` — `_migrated_one` (body of `Migrations.migrated`) and the
+      module-level multi-output `migrated({...})` with its TypedDict return check
+  - `foundry/` — everything that touches a Foundry output
+    - `protocols.py` — `TransformOutput` Protocol (the parts of Foundry's output the library
+      calls; `transforms.api` isn't available locally), `WriteOptions`
+    - `prepared.py` — `PreparedOutput` (returned by `prepare`): `write`, `rewrite`
+  - `core/migrations.py` imports from `foundry/` (`prepare`/`migrated` are methods);
+    `foundry/prepared.py` and `core/decorators.py` import `Migrations` only under
+    TYPE_CHECKING, so there's no cycle.
+- `tests/test_schema_migrations.py` — pytest suite, runs on local Spark with fake Foundry objects
+- `pyproject.toml` — pytest config (repo root on the path, `tests/` as test path)
 - `README.md` — user-facing docs
 
 ## Run tests
 
 ```bash
-uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python "pyspark==3.5.3" pytest mypy   # needs Java 11+
+uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python "pyspark==3.5.3" pytest mypy black   # needs Java 11+
 .venv/bin/python -m pytest -q
-.venv/bin/python -m mypy --disallow-untyped-defs schema_migrations test_schema_migrations.py
+.venv/bin/python -m mypy --disallow-untyped-defs schema_migrations tests
 ```
 
 ## How it works

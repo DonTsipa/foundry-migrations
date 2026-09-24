@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 from .enums import CheckedData
 
 if TYPE_CHECKING:
-    from .migrations import Migration
+    from .core.migration import Migration
 
 
 class MigrationError(Exception):

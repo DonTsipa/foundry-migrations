@@ -16,10 +16,13 @@ from .exceptions import (
     ReturnAnnotationError,
     ReturnedOutputsError,
 )
-from .migrations import Migration, Migrations, PreparedOutput, migrated
-from .protocols import TransformOutput
-from .schema import check_schema
-from .versions import VERSION_COL
+from .core.decorators import migrated
+from .core.migration import Migration
+from .core.migrations import Migrations
+from .foundry.prepared import PreparedOutput
+from .foundry.protocols import TransformOutput
+from .core.schema import check_schema
+from .core.versions import VERSION_COL
 
 __all__ = [
     "Migration",

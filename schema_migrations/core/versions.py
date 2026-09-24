@@ -5,7 +5,7 @@ from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql import types as T
 
-from .exceptions import VersionColumnTypeError
+from ..exceptions import VersionColumnTypeError
 
 VERSION_COL = "_schema_version"
 
