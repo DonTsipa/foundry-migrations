@@ -15,11 +15,15 @@ m = Migrations([
 ])
 
 @incremental(require_incremental=True)
-@transform(out=Output(...), src=Input(...))
+@transform(out=Output(..., checks=[VERSION_CHECK]), src=Input(...))
 @m.migrated()                                  # innermost
 def compute(src, out):
     return business_logic(src.dataframe())     # return new rows, don't write
 ```
+
+`VERSION_CHECK` (`from myproject.schema_migrations import VERSION_CHECK`) fails the build
+if any row is written without `_schema_version`, e.g. by `out.write_dataframe` instead of
+the library. Add it to every migrated output.
 
 ## Use cases
 
@@ -49,13 +53,18 @@ def compute(src, orders, items) -> Outputs:
     return {"orders": to_orders(df), "items": to_items(df)}
 ```
 
-Upserts / dedup that `replace` every run: `merge` gets the migrated previous rows.
+Reconcile and `replace` every run (upserts, dedup): take the migrated previous rows,
+combine them with the new ones, and write everything with `rewrite`.
 
 ```python
 prepared = m.prepare(out)
 new_rows = business_logic(src.dataframe())
-prepared.rewrite(lambda previous: upsert(previous, new_rows), expected=new_rows.schema)
+previous = prepared.previous(new_rows.schema)      # migrated; empty with these columns on the first run
+prepared.rewrite(reconcile(previous, new_rows))    # stamped, written with replace
 ```
+
+Always write it with `rewrite`, not `out.write_dataframe`: an output without
+`_schema_version` makes the next run re-apply every migration.
 
 Unit test without data: `m.dry_run(spark, BASELINE_SCHEMA, expected=LATEST_SCHEMA)`.
 
@@ -93,3 +102,4 @@ while writing (e.g. in a UDF) don't name the migration.
 4. Incremental builds continue after a dataset rollback.
 5. With several outputs, a build that fails after one output was written commits none.
 6. `spark.sql.parquet.aggregatePushdown=true` shows `PushedAggregation` for the version check.
+7. `VERSION_CHECK` builds with Foundry's `Check` / `E.col(...).non_null()` API and fails the build.

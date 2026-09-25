@@ -147,14 +147,14 @@ def test_int_to_struct(spark: SparkSession) -> None:
     to_struct = Migration(1, "A -> struct", lambda df: df.withColumn("A",
         F.when(F.col("A").isNull(), F.lit(None).cast(a_type))
          .otherwise(F.struct(F.col("A").alias("value"), F.lit("kg").alias("unit")))))  # lit = non-nullable
-    out = prepare(Migrations([to_struct]), spark.createDataFrame([("x", 5), ("y", None)], "id string, A int"))._previous_rows(target)
+    out = prepare(Migrations([to_struct]), spark.createDataFrame([("x", 5), ("y", None)], "id string, A int")).previous(target)
     got = {r["id"]: r["A"] for r in out.collect()}
     assert tuple(got["x"]) == (5, "kg") and got["y"] is None
 
     as_long = Migration(1, "A -> struct", lambda df: df.withColumn(
         "A", F.struct(F.col("A").cast("long").alias("value"), F.lit("kg").alias("unit"))))
     with pytest.raises(SchemaMismatchError, match="wrong types"):              # real type difference
-        prepare(Migrations([as_long]), spark.createDataFrame([("x", 5)], "id string, A int"))._previous_rows(target)
+        prepare(Migrations([as_long]), spark.createDataFrame([("x", 5)], "id string, A int")).previous(target)
 
 
 # ---------- write / @migrated (fake Foundry objects) ----------
@@ -180,21 +180,19 @@ class FakeOutput:
 
 
 def test_rewrite(spark: SparkSession) -> None:
-    seen: list[DataFrame] = []
+    def reconcile(previous: DataFrame, new_rows: DataFrame) -> DataFrame:
+        return previous.join(new_rows.select("id"), "id", "left_anti").unionByName(new_rows)
 
-    def merge(previous: DataFrame) -> DataFrame:
-        seen.append(previous)
-        return previous.unionByName(new(spark, ("b", 2.0, "t")))
-
-    out = FakeOutput(spark, stored=spark.createDataFrame([("a", 5)], V0))
-    m().prepare(out).rewrite(merge, expected=TARGET)
-    assert seen[0].columns == ["id", "amount", "status"]         # migrated, no version column
+    out = FakeOutput(spark, stored=spark.createDataFrame([("a", 5), ("b", 6)], V0))
+    prepared = m().prepare(out)
+    new_rows = new(spark, ("b", 2.0, "t"))
+    previous = prepared.previous(new_rows.schema)
+    assert previous.columns == ["id", "amount", "status"]                   # migrated, no version column
+    prepared.rewrite(reconcile(previous, new_rows))
     assert out.mode == "replace" and rows(out.written) == [("a", 5.0, None, 3), ("b", 2.0, "t", 3)]
 
-    first_run = FakeOutput(spark)                                 # empty previous gets the expected columns
-    m().prepare(first_run).rewrite(merge, expected=TARGET)
-    assert seen[1].columns == ["id", "amount", "status"] and rows(first_run.written) == [("b", 2.0, "t", 3)]
-
+    first_run = m().prepare(FakeOutput(spark))                             # empty, with the new rows' columns
+    assert first_run.previous(new_rows.schema).columns == ["id", "amount", "status"]
 
 def test_decorator(spark: SparkSession) -> None:
     calls: list[str] = []

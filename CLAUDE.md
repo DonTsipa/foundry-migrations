@@ -25,7 +25,11 @@ and open questions so work can continue without the original conversation.
   - `foundry/` — everything that touches a Foundry output
     - `protocols.py` — `TransformOutput` Protocol (the parts of Foundry's output the library
       calls; `transforms.api` isn't available locally), `WriteOptions`
-    - `prepared.py` — `PreparedOutput` (returned by `prepare`): `write`, `rewrite`
+    - `prepared.py` — `PreparedOutput` (returned by `prepare`): `write`, `previous`, `rewrite`
+    - `checks.py` — `VERSION_CHECK`: Foundry `Check(E.col(VERSION_COL).non_null(), ..., on_error="FAIL")`
+      for `Output(..., checks=[VERSION_CHECK])`; catches writes that bypass the library.
+      Needs Foundry's `transforms`, so the package loads it lazily via module
+      `__getattr__` (the package still imports locally). Untested with the real API.
   - `core/migrations.py` imports from `foundry/` (`prepare`/`migrated` are methods);
     `foundry/prepared.py` and `core/decorators.py` import `Migrations` only under
     TYPE_CHECKING, so there's no cycle.
@@ -52,7 +56,7 @@ uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python "pyspark==3.5.3" pyt
     data newer than code, data older than baseline. Per-version breakdown only on error.
   - `prepare(out)` → `PreparedOutput`: reads previous, checks versions, plans migrations
     BEFORE business logic (user asked for fail-fast, incl. multi-output transforms). The
-    handle's `write(new_rows)` / `rewrite(merge, expected=)` reuse that check. The decorator
+    handle's `write(new_rows)` / `previous(schema)` + `rewrite(all_rows)` reuse that check. The decorator
     prepares before calling the function. `prepare` is THE way without a decorator: the
     `m.write`/`m.rewrite` shortcuts were removed because they checked only after the
     business logic ran.
@@ -62,11 +66,13 @@ uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python "pyspark==3.5.3" pyt
     return annotation must be a TypedDict with exactly those fields, all `DataFrame`
     (`ReturnAnnotationError` at import; resolved with `get_type_hints`, so the TypedDict
     must be at module level).
-  - `PreparedOutput.rewrite(merge, expected=...)` — for merge-then-replace transforms: `merge` gets the
-    migrated previous rows WITHOUT the version column and returns everything to write; the
-    library checks, stamps and writes with `replace`. Replaced public `migrate` + `replace`:
-    returning unversioned data to users let them write it unstamped, and the next run then
-    re-applied every migration (silent corruption, reproduced).
+  - `PreparedOutput.previous(schema)` + `rewrite(all_rows)` — for reconcile-then-replace
+    transforms: `previous` returns the migrated previous rows checked against `schema`,
+    WITHOUT the version column (empty with those columns on the first run); `rewrite`
+    stamps and writes with `replace`. User rejected passing a merge function (callback);
+    chose to drop the version column from `previous` despite the risk: writing the result
+    with `out.write_dataframe` instead of `rewrite` leaves the output unversioned and the
+    next run re-applies every migration (silent corruption, reproduced). Documented.
   - `PreparedOutput._resolve(new_rows)` → `(df, WriteMode)`.
   - `PreparedOutput.write(new_rows, write_options=None)` — appends, or replaces after a
     migration.
@@ -119,6 +125,8 @@ uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python "pyspark==3.5.3" pyt
    `spark.sql.parquet.aggregatePushdown=true` shows `PushedAggregation` in the plan.
 5. After rolling a dataset back to an earlier transaction (the recovery advised in the
    mixed-versions error), the next incremental build still runs incrementally.
+6. `VERSION_CHECK`: Foundry's `Check` / `E.col(...).non_null()` API names, and that a
+   FAIL check aborts the transaction (tested only with a fake `transforms` module).
 
 ## Background from the conversation
 

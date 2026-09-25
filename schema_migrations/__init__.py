@@ -49,3 +49,12 @@ __all__ = [
     "ReturnAnnotationError",
     "ReturnedOutputsError",
 ]
+
+
+def __getattr__(name: str) -> object:
+    # VERSION_CHECK needs Foundry's `transforms` package; import it only when asked for
+    if name == "VERSION_CHECK":
+        from .foundry.checks import VERSION_CHECK
+
+        return VERSION_CHECK
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
