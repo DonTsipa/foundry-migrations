@@ -29,9 +29,11 @@ class PreparedOutput:
     def write(
         self, new_rows: DataFrame, write_options: WriteOptions | None = None
     ) -> None:
-        """Append `new_rows`, or, if migrations were pending, rewrite the whole output with
-        the migrated previous rows plus `new_rows`. The previous rows must match the new
-        rows' schema.
+        """Write `new_rows` to the output, with `_schema_version` added: append them, or
+        replace the whole output with the migrated previous rows plus `new_rows` if
+        migrations were pending. Replaces on the first run (empty previous output) and for
+        snapshot outputs. Raises `SchemaMismatchError`, before writing, if the previous
+        rows don't match the new rows' schema.
 
         write_options: extra keyword arguments for out.write_dataframe, passed unchanged,
                        e.g. {"partition_cols": ["date"]}."""
@@ -54,9 +56,9 @@ class PreparedOutput:
     def rewrite(
         self, all_rows: DataFrame, write_options: WriteOptions | None = None
     ) -> None:
-        """Replace the whole output with `all_rows`, marked with the latest version. For
-        transforms that reconcile `previous(...)` with new rows themselves (upserts, dedup)
-        or recompute everything.
+        """Replace the whole output with `all_rows`, marked with the latest version. Doesn't
+        check `all_rows` against the previous output. For transforms that reconcile
+        `previous(...)` with new rows themselves (upserts, dedup) or recompute everything.
 
         write_options: see `write`."""
         if not isinstance(all_rows, DataFrame):

@@ -82,6 +82,11 @@ def test_bad_configuration_fails_at_import() -> None:
     with pytest.raises(VersionGapError, match=r"missing \[2\]"):
         Migrations([M1, M3])
 
+    amount_check, status_check = object(), object()                            # stand-ins for Foundry Checks
+    with_checks = Migrations([Migration(1, "rename amt", M1.upgrade, checks=[amount_check]), M2,
+                              Migration(3, "add status", M3.upgrade, checks=[status_check])])
+    assert with_checks.checks == [amount_check, status_check] and m().checks == []
+
 
 # ---------- versions ----------
 

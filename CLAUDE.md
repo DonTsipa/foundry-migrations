@@ -14,7 +14,7 @@ and open questions so work can continue without the original conversation.
     own message and keeping the relevant values as attributes
   - `core/` — plain Spark
     - `migration.py` — `Migration` (one schema change; runs itself via `_apply`)
-    - `migrations.py` — `Migrations` (the chain): public `prepare`, `migrated`, `dry_run`;
+    - `migrations.py` — `Migrations` (the chain): public `prepare`, `migrated`, `dry_run`, `checks`;
       private `_current_version`, `_upgrade`, `_check_previous`, `_stamp`, `_latest`,
       `_baseline`
     - `versions.py` — `VERSION_COL`, `VersionStats` (one aggregation over the previous
@@ -78,6 +78,10 @@ uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python "pyspark==3.5.3" pyt
     migration.
   - `@m.migrated()` — decorator placed directly above `def`, below `@transform`: prepares,
     calls the function (which RETURNS new rows), then `PreparedOutput.write`.
+  - `Migration(..., checks=[...])` — Foundry `Check`s valid from that version on;
+    `Migrations.checks` lists the kept migrations' checks, oldest first, for
+    `Output(..., checks=[VERSION_CHECK, *m.checks])`. `VERSION_CHECK` isn't included, so
+    `core/` never imports `transforms`. Typed `object` (Check isn't available locally).
   - `dry_run(spark, baseline_schema, expected)` — unit-test aid, runs chain on empty frame.
 
 ## Design decisions (agreed with the user — keep them)
@@ -105,6 +109,20 @@ uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python "pyspark==3.5.3" pyt
    it and returns only the schema's columns; `_stamp` overwrites it with `withColumn`.
    Matched case-insensitively. Unversioned data never leaves the library unstamped.
 
+10. **Adding a column (preferred pattern, documented in README):** `withColumn` silently
+    overwrites an existing column and the schema check can't see it, so "add column"
+    migrations should return `df` unchanged if the column already exists (keeps stored
+    values, e.g. legacy data when adopting the library). A different existing type still
+    fails the schema check. Verified locally. Not a library helper (decision 1).
+
+11. **Checks per migration (option A)** are plain Foundry `Check`s; Foundry runs all of
+    them on every build against the latest schema, never on intermediate versions.
+    User rejected a `deprecates=` mechanism and Python `check(before, after)` callables.
+    Rule (documented, not enforced): when a new migration contradicts an old check,
+    remove it from the old migration in the same commit and leave a comment naming the
+    overriding migration. This is the only allowed edit to a migration that already ran.
+    Removing old migrations drops their checks; move still-valid ones to the oldest kept.
+
 ## Known limitations (documented in README)
 
 - A `cast` that turns bad values into null is not detected (PySpark does it silently).
@@ -127,6 +145,8 @@ uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python "pyspark==3.5.3" pyt
    mixed-versions error), the next incremental build still runs incrementally.
 6. `VERSION_CHECK`: Foundry's `Check` / `E.col(...).non_null()` API names, and that a
    FAIL check aborts the transaction (tested only with a fake `transforms` module).
+7. Migration checks: what a Check on a column that no longer exists does (fails the build
+   or is skipped), and whether checks on an incremental append see only the new rows.
 
 ## Background from the conversation
 

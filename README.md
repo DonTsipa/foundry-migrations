@@ -25,6 +25,56 @@ def compute(src, out):
 if any row is written without `_schema_version`, e.g. by `out.write_dataframe` instead of
 the library. Add it to every migrated output.
 
+## Adding a column
+
+> [!WARNING]
+> `withColumn` silently **overwrites** a column that already exists, and the schema check
+> can't notice. If the stored data already has the column (legacy data when you adopt the
+> library, or an output that lost its version), a plain "add column" migration wipes its
+> values.
+
+Preferred way: add the column only if it's missing, so existing values are kept.
+
+```python
+def add_currency(df):
+    if "currency" in df.columns:      # already there: keep the stored values
+        return df
+    return df.withColumn("currency", F.lit(None).cast("string"))
+
+Migration(3, "add currency", add_currency)
+```
+
+If the existing column has a different type, the build still fails on the schema check.
+
+## Checks
+
+A migration can carry Foundry `Check`s that must hold from its version on. `m.checks`
+collects the checks of all kept migrations for the output:
+
+```python
+AMOUNT_NOT_NULL = Check(E.col("amount").non_null(), "amount not null", on_error="FAIL")
+
+m = Migrations([
+    Migration(1, "rename amt to amount", rename_amt, checks=[AMOUNT_NOT_NULL]),
+])
+
+@transform(out=Output(..., checks=[VERSION_CHECK, *m.checks]), src=Input(...))
+```
+
+Foundry runs every check on every build, against the latest schema only. When a new
+migration contradicts an old check (drops or renames its column, changes its type or
+meaning), remove the check from the old migration in the same commit and leave a comment
+there saying which migration overrides it:
+
+```python
+Migration(1, "rename amt to amount", rename_amt,
+          checks=[]),  # AMOUNT_NOT_NULL removed: overridden by migration 3 (drop amount)
+Migration(2, ...),
+Migration(3, "drop amount", lambda df: df.drop("amount")),
+```
+
+With `on_error="WARN"` a forgotten contradicted check only warns.
+
 ## Use cases
 
 Without a decorator, `prepare` every output first: it checks the previous output and
@@ -46,7 +96,11 @@ class Outputs(TypedDict):
     items: DataFrame
 
 @incremental(require_incremental=True)
-@transform(orders=Output(...), items=Output(...), src=Input(...))
+@transform(
+    orders=Output(..., checks=[VERSION_CHECK]),
+    items=Output(..., checks=[VERSION_CHECK]),
+    src=Input(...),
+)
 @migrated({"orders": orders_m, "items": items_m})
 def compute(src, orders, items) -> Outputs:
     df = business_logic(src.dataframe())
@@ -73,10 +127,12 @@ Int → struct: `cast()` can't do it; build with `F.struct` and keep nulls as nu
 
 ## Rules
 
-- A new migration gets `latest + 1`. Never change one that already ran.
+- A new migration gets `latest + 1`. Never change one that already ran, except to
+  remove a check a newer migration contradicts (see Checks).
 - Change the migration list in the same commit as the business logic.
 - Remove old migrations only from the **start** of the list, once all data is past them.
-  Data older than the oldest kept version − 1 then fails the build.
+  Data older than the oldest kept version − 1 then fails the build. Move their checks to
+  the oldest kept migration, or they stop being run.
 
 ## What fails the build
 

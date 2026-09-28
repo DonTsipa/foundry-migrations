@@ -62,7 +62,9 @@ def migrated[**TransformParams](
 ) -> Callable[
     [Callable[TransformParams, Mapping[str, object]]], Callable[TransformParams, None]
 ]:
-    """Decorator for a transform with several migrated outputs.
+    """Decorator for a transform with several migrated outputs. WRITES every output in
+    `migrations` (see `PreparedOutput.write`): appends the returned rows, or rewrites the
+    whole output after a migration. The function must not write to them itself.
 
     migrations:       output parameter name -> that output's Migrations.
     previous_schemas: output name -> schema for out.dataframe("previous", schema=...).
@@ -70,7 +72,8 @@ def migrated[**TransformParams](
 
     The function is annotated to return a TypedDict with one DataFrame field per output
     (checked at import) and returns the new rows in it. Every output is prepared before the
-    function runs; all returned rows are checked before any is written.
+    function runs; all returned rows are checked before any is written. The decorated
+    transform returns None.
     """
     schemas, options = previous_schemas or {}, write_options or {}
 

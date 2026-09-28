@@ -1,6 +1,6 @@
 """One schema change."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from pyspark.sql import DataFrame
@@ -12,11 +12,15 @@ type Upgrade = Callable[[DataFrame], DataFrame]
 
 @dataclass(frozen=True)
 class Migration:
-    """One schema change: `upgrade` brings rows from `version - 1` to `version`."""
+    """One schema change: `upgrade` brings rows from `version - 1` to `version`.
+
+    checks: Foundry `Check`s for the output from this version on; `Migrations.checks`
+            collects them for `Output(..., checks=...)`."""
 
     version: int
     description: str
     upgrade: Upgrade
+    checks: Sequence[object] = ()
 
     def __post_init__(self) -> None:
         if self.version < 1:

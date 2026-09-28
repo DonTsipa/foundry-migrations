@@ -41,12 +41,23 @@ class Migrations:
 
     # ---------- public API ----------
 
+    @property
+    def checks(self) -> list[object]:
+        """Foundry `Check`s of all kept migrations, oldest first, for
+        `Output(..., checks=[VERSION_CHECK, *m.checks])`."""
+        return [
+            check
+            for version in sorted(self._by_version)
+            for check in self._by_version[version].checks
+        ]
+
     def prepare(
         self, out: TransformOutput, previous_schema: T.StructType | None = None
     ) -> PreparedOutput:
         """Check the previous output of `out` now and plan its pending migrations, before
-        any business logic runs. Raises if it can't be migrated. Costs one aggregation,
-        which isn't repeated when writing to the returned handle.
+        any business logic runs. Raises if it can't be migrated. Writes nothing: write
+        through the returned handle. Costs one aggregation, which isn't repeated when
+        writing to the handle.
 
         previous_schema: passed to out.dataframe("previous", schema=...), if your
                          transforms version needs it."""
@@ -70,7 +81,10 @@ class Migrations:
         [Callable[TransformParams, DataFrame]], Callable[TransformParams, None]
     ]:
         """Decorator for a transform that returns its new rows. The output is prepared
-        before the function runs, then the rows are written to it.
+        before the function runs, then the decorator WRITES the rows to it (see
+        `PreparedOutput.write`): appends them, or rewrites the whole output after a
+        migration. The function must not write to the output itself; the decorated
+        transform returns None.
 
         output:          name of the output parameter, needed only when there are several.
         previous_schema: see `prepare`; write_options: see `PreparedOutput.write`."""
@@ -82,7 +96,8 @@ class Migrations:
         baseline_schema: T.StructType,
         expected: T.StructType | None = None,
     ) -> T.StructType:
-        """Run the whole chain on an empty frame with the baseline schema; return the result schema."""
+        """Run the whole chain on an empty frame with the baseline schema; return the result
+        schema. Raises `SchemaMismatchError` if `expected` is given and differs."""
         df = self._upgrade(spark.createDataFrame([], baseline_schema), self._baseline)
         if expected is not None:
             df = self._check_previous(df, self._baseline, expected)
