@@ -8,9 +8,8 @@ import pytest
 from pyspark.sql import DataFrame, SparkSession, functions as F, types as T
 
 from schema_migrations import (
-    VERSION_COL, DataNewerThanCodeError, DataOlderThanBaselineError, DuplicateVersionError,
-    InvalidVersionError, Migration, MigrationError, MigrationFailedError, Migrations, MixedVersionsError,
-    NotADataFrameError, PreparedOutput, ReturnAnnotationError, ReturnedOutputsError, SchemaMismatchError, VersionColumnTypeError, VersionGapError, migrated,
+    VERSION_COL, ConfigError, DataStateError, Migration, MigrationError, MigrationFailedError, Migrations,
+    PreparedOutput, SchemaMismatchError, UsageError, migrated, MigratedOutput,
 )
 
 V0 = T.StructType([T.StructField("id", T.StringType()), T.StructField("amt", T.IntegerType())])
@@ -47,6 +46,11 @@ def m() -> Migrations:
     return Migrations([M1, M2, M3])
 
 
+def stamped(df: DataFrame) -> DataFrame:
+    """df as the library writes it at the latest version (3)."""
+    return df.withColumn(VERSION_COL, F.lit(3))
+
+
 def rows(df: DataFrame | None) -> list[tuple]:
     assert df is not None
     return sorted(tuple(r) for r in df.collect())
@@ -75,11 +79,11 @@ def prepare(migrations: Migrations, prev: DataFrame) -> PreparedOutput:
 # ---------- configuration ----------
 
 def test_bad_configuration_fails_at_import() -> None:
-    with pytest.raises(InvalidVersionError):
+    with pytest.raises(ConfigError, match=">= 1"):
         Migration(0, "x", lambda df: df)
-    with pytest.raises(DuplicateVersionError):
+    with pytest.raises(ConfigError, match="used twice"):
         Migrations([M1, M2, Migration(2, "other", M3.upgrade)])
-    with pytest.raises(VersionGapError, match=r"missing \[2\]"):
+    with pytest.raises(ConfigError, match=r"missing \[2\]"):
         Migrations([M1, M3])
 
     amount_check, status_check = object(), object()                            # stand-ins for Foundry Checks
@@ -101,25 +105,26 @@ def test_write_modes(spark: SparkSession) -> None:
     assert rows(resolve(m(), at_v2, new(spark))[0]) == [("a", 5.0, None, 3)]
     assert rows(resolve(Migrations([M3]), at_v2, new(spark))[0]) == [("a", 5.0, None, 3)]  # 1-2 removed
 
-    up_to_date = m()._stamp(new(spark, ("a", 1.0, "s")))
+    up_to_date = stamped(new(spark, ("a", 1.0, "s")))
     reordered = new(spark, ("b", 2.0, "t")).select("status", "amount", "id")
     appended, mode = resolve(m(), up_to_date, reordered)
     assert mode == "modify" and rows(appended) == [("b", 2.0, "t", 3)]
     assert appended.columns == ["id", "amount", "status", VERSION_COL]          # stored column order
+    plan = prepare(m(), up_to_date).plan_write(reordered)                       # for a native write
+    assert plan.mode == "modify" and plan.df.columns == appended.columns
 
 
 def test_bad_previous_output_fails(spark: SparkSession) -> None:
     ddl = "id string, amount double, status string"
     mixed = at_version(spark, [("a", 1.0, "s", None), ("b", 2.0, "s", 3)], ddl)
-    with pytest.raises(MixedVersionsError) as error:
+    with pytest.raises(DataStateError, match=r"rows per version: \{0: 1, 3: 1\}"):
         prepare(m(), mixed)
-    assert error.value.rows_per_version == {0: 1, 3: 1}
-    with pytest.raises(DataNewerThanCodeError):
+    with pytest.raises(DataStateError, match="code only knows up to 3"):
         prepare(m(), at_version(spark, [("a", 1.0, "s", 4)], ddl))
-    with pytest.raises(DataOlderThanBaselineError):                             # 1-2 removed
+    with pytest.raises(DataStateError, match="were removed"):                             # 1-2 removed
         prepare(Migrations([M3]), at_version(spark, [("a", 5.0, 1)], "id string, amount double"))
     # "abc" would aggregate to a null version and look like an empty output (data loss)
-    with pytest.raises(VersionColumnTypeError):
+    with pytest.raises(DataStateError, match="expected an integer"):
         prepare(m(), spark.createDataFrame([("a", 1.0, "s", "abc")], f"{ddl}, {VERSION_COL} string"))
 
 
@@ -135,7 +140,7 @@ def test_mistakes_caught(spark: SparkSession) -> None:
 
     changed = spark.createDataFrame([("b", 2.0, "s", 1)], "id string, amount double, status string, extra int")
     with pytest.raises(SchemaMismatchError, match="without adding a Migration"):
-        resolve(m(), m()._stamp(new(spark, ("a", 1.0, "s"))), changed)
+        resolve(m(), stamped(new(spark, ("a", 1.0, "s"))), changed)
 
     bad = Migrations([Migration(1, "broken", lambda df: df.withColumn("y", F.col("nope")))])
     with pytest.raises(MigrationFailedError, match=r"Migration 1 \(broken\)"):
@@ -198,19 +203,37 @@ def test_rewrite(spark: SparkSession) -> None:
 
     first_run = m().prepare(FakeOutput(spark))                             # empty, with the new rows' columns
     assert first_run.previous(new_rows.schema).columns == ["id", "amount", "status"]
+    plan = first_run.plan_rewrite(new_rows)                                # for a native write
+    assert plan.mode == "replace" and rows(plan.df) == [("b", 2.0, "t", 3)]
+
+    @migrated(m(), mode="rewrite")
+    def compute(src: FakeInput, out: MigratedOutput) -> DataFrame:
+        new_rows = src.dataframe()
+        return reconcile(out.previous(new_rows.schema), new_rows)
+    assert list(inspect.signature(compute).parameters) == ["src", "out"]   # @transform can still map names
+
+    out = FakeOutput(spark, stored=spark.createDataFrame([("a", 5), ("b", 6)], V0))
+    compute(src=FakeInput(new(spark, ("b", 2.0, "t"))), out=out)
+    assert out.mode == "replace" and rows(out.written) == [("a", 5.0, None, 3), ("b", 2.0, "t", 3)]
+    first = FakeOutput(spark)
+    compute(FakeInput(new(spark, ("b", 2.0, "t"))), first)                 # positional, first run
+    assert first.mode == "replace" and rows(first.written) == [("b", 2.0, "t", 3)]
+
+    with pytest.raises(UsageError, match="mode must be"):                  # at import
+        migrated(m(), mode="replace")  # type: ignore[call-overload]
 
 def test_decorator(spark: SparkSession) -> None:
     calls: list[str] = []
 
-    @m().migrated()
-    def compute(src: FakeInput, out: FakeOutput) -> DataFrame:
+    @migrated(m(), mode="append")
+    def compute(src: FakeInput, out: MigratedOutput) -> DataFrame:
         calls.append("business logic")
         return src.dataframe()
     assert list(inspect.signature(compute).parameters) == ["src", "out"]   # @transform can still map names
 
     mixed = at_version(spark, [("a", 1.0, "s", 2), ("b", 2.0, "s", 3)], "id string, amount double, status string")
     broken = FakeOutput(spark, stored=mixed)
-    with pytest.raises(MixedVersionsError):
+    with pytest.raises(DataStateError):
         compute(src=FakeInput(new(spark)), out=broken)
     assert calls == [] and broken.written is None                 # checked before business logic
 
@@ -218,40 +241,55 @@ def test_decorator(spark: SparkSession) -> None:
     compute(src=FakeInput(new(spark, ("b", 2.0, "t"))), out=out)
     assert out.mode == "replace" and rows(out.written) == [("a", 5.0, None, 3), ("b", 2.0, "t", 3)]
 
-    @m().migrated()  # type: ignore[arg-type]  # deliberately returns nothing
-    def writes_itself(src: FakeInput, out: FakeOutput) -> None:
+    @migrated(m(), mode="append")  # type: ignore[arg-type]  # deliberately returns nothing
+    def writes_itself(src: FakeInput, out: MigratedOutput) -> None:
         out.write_dataframe(src.dataframe())
-    with pytest.raises(NotADataFrameError):
+    with pytest.raises(UsageError, match="called out.write_dataframe"):
         writes_itself(src=FakeInput(new(spark)), out=FakeOutput(spark))
+
+    @migrated(m(), mode="append")
+    def returns_nothing(src: FakeInput, out: MigratedOutput) -> DataFrame:
+        return None  # type: ignore[return-value]
+    with pytest.raises(UsageError, match="must return its rows as a DataFrame"):
+        returns_nothing(src=FakeInput(new(spark)), out=FakeOutput(spark))
+
+    @migrated(m(), mode="append")
+    def two_outputs(src: FakeInput, out: FakeOutput, other: FakeOutput) -> DataFrame:
+        return src.dataframe()
+    with pytest.raises(UsageError, match=r"exactly one output, got \['out', 'other'\]"):
+        two_outputs(src=FakeInput(new(spark)), out=FakeOutput(spark), other=FakeOutput(spark))
 
 
 def test_several_outputs(spark: SparkSession) -> None:
     calls: list[str] = []
 
-    @migrated({"orders": m(), "items": m()})
-    def compute(src: FakeInput, orders: FakeOutput, items: FakeOutput) -> OrdersAndItems:
+    @migrated({"orders": m(), "items": m()}, mode={"orders": "append", "items": "rewrite"})
+    def compute(src: FakeInput, orders: MigratedOutput, items: MigratedOutput) -> OrdersAndItems:
         calls.append("business logic")
         return {"orders": src.dataframe(), "items": src.dataframe()}
     assert list(inspect.signature(compute).parameters) == ["src", "orders", "items"]
 
-    orders = FakeOutput(spark, stored=m()._stamp(new(spark, ("a", 1.0, "s"))))     # up to date
+    orders = FakeOutput(spark, stored=stamped(new(spark, ("a", 1.0, "s"))))     # up to date
     newer = at_version(spark, [("a", 1.0, "s", 4)], "id string, amount double, status string")
-    with pytest.raises(DataNewerThanCodeError):                                      # items is broken
+    with pytest.raises(DataStateError):                                              # items is broken
         compute(src=FakeInput(new(spark, ("b", 2.0, "t"))), orders=orders, items=FakeOutput(spark, stored=newer))
     assert calls == [] and orders.written is None                     # nothing ran, nothing written
 
     items = FakeOutput(spark, stored=spark.createDataFrame([("a", 5)], V0))          # legacy
     compute(src=FakeInput(new(spark, ("b", 2.0, "t"))), orders=orders, items=items)
     assert orders.mode == "modify" and rows(orders.written) == [("b", 2.0, "t", 3)]
-    assert items.mode == "replace" and rows(items.written) == [("a", 5.0, None, 3), ("b", 2.0, "t", 3)]
+    assert items.mode == "replace" and rows(items.written) == [("b", 2.0, "t", 3)]  # rewrite: only what's returned
 
-    with pytest.raises(ReturnAnnotationError):                        # at import
-        @migrated({"orders": m(), "items": m()})
+    with pytest.raises(UsageError, match="annotated"):                # at import
+        @migrated({"orders": m(), "items": m()}, mode="append")
         def wrong_type(src: FakeInput, orders: FakeOutput, items: FakeOutput) -> OrdersOnly:
             return {"orders": src.dataframe()}
 
-    @migrated({"orders": m(), "items": m()})
+    with pytest.raises(UsageError, match="got modes for"):             # at import
+        migrated({"orders": m(), "items": m()}, mode={"orders": "append"})
+
+    @migrated({"orders": m(), "items": m()}, mode="append")
     def forgets_items(src: FakeInput, orders: FakeOutput, items: FakeOutput) -> OrdersAndItems:
         return {"orders": src.dataframe()}  # type: ignore[typeddict-item]
-    with pytest.raises(ReturnedOutputsError):                         # at run time
+    with pytest.raises(UsageError, match="must return"):              # at run time
         forgets_items(src=FakeInput(new(spark)), orders=FakeOutput(spark), items=FakeOutput(spark))

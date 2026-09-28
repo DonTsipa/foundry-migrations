@@ -4,7 +4,7 @@ only when used (see `schema_migrations.__getattr__`)."""
 from transforms import expectations as E  # type: ignore[import-not-found]
 from transforms.api import Check  # type: ignore[import-not-found]
 
-from ..core.versions import VERSION_COL
+from .schema import VERSION_COL
 
 # Fails the build if an output is written without a version on every row, e.g. with
 # out.write_dataframe instead of the library. Add it to each migrated output:

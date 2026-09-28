@@ -1,60 +1,42 @@
 """Versioned schema migrations for incremental Foundry (PySpark) transforms. See README.md."""
-from .enums import CheckedData, WriteMode
-from .exceptions import (
+from .decorator import MigratedOutput, Mode, migrated
+from .errors import (
+    ConfigError,
+    DataStateError,
     MigrationError,
-    InvalidVersionError,
-    DuplicateVersionError,
-    VersionGapError,
-    MixedVersionsError,
-    DataNewerThanCodeError,
-    DataOlderThanBaselineError,
-    VersionColumnTypeError,
     MigrationFailedError,
     SchemaMismatchError,
-    NotADataFrameError,
-    OutputNotFoundError,
-    ReturnAnnotationError,
-    ReturnedOutputsError,
+    UsageError,
 )
-from .core.decorators import migrated
-from .core.migration import Migration
-from .core.migrations import Migrations
-from .foundry.prepared import PreparedOutput
-from .foundry.protocols import TransformOutput
-from .core.schema import check_schema
-from .core.versions import VERSION_COL
+from .migrations import Migration, Migrations
+from .prepared import PlannedWrite, PreparedOutput, TransformOutput, WriteOptions
+from .schema import VERSION_COL, check_schema
 
 __all__ = [
     "Migration",
     "Migrations",
-    "PreparedOutput",
     "migrated",
+    "Mode",
+    "MigratedOutput",
+    "PreparedOutput",
+    "PlannedWrite",
     "TransformOutput",
+    "WriteOptions",
     "VERSION_COL",
     "check_schema",
-    "CheckedData",
-    "WriteMode",
     "MigrationError",
-    "InvalidVersionError",
-    "DuplicateVersionError",
-    "VersionColumnTypeError",
-    "VersionGapError",
-    "MixedVersionsError",
-    "DataNewerThanCodeError",
-    "DataOlderThanBaselineError",
+    "ConfigError",
+    "DataStateError",
     "MigrationFailedError",
     "SchemaMismatchError",
-    "NotADataFrameError",
-    "OutputNotFoundError",
-    "ReturnAnnotationError",
-    "ReturnedOutputsError",
+    "UsageError",
 ]
 
 
 def __getattr__(name: str) -> object:
     # VERSION_CHECK needs Foundry's `transforms` package; import it only when asked for
     if name == "VERSION_CHECK":
-        from .foundry.checks import VERSION_CHECK
+        from .checks import VERSION_CHECK
 
         return VERSION_CHECK
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

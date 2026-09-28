@@ -7,32 +7,28 @@ and open questions so work can continue without the original conversation.
 ## Files
 
 - `schema_migrations/` — the library package (PySpark only, Python 3.12 syntax). Users
-  copy this folder into their Foundry repo.
-  - `__init__.py` — re-exports the public names
-  - `enums.py` — `CheckedData` (which data failed a schema check), `WriteMode`
-  - `exceptions.py` — `MigrationError` and one subclass per failure, each building its
-    own message and keeping the relevant values as attributes
-  - `core/` — plain Spark
-    - `migration.py` — `Migration` (one schema change; runs itself via `_apply`)
-    - `migrations.py` — `Migrations` (the chain): public `prepare`, `migrated`, `dry_run`, `checks`;
-      private `_current_version`, `_upgrade`, `_check_previous`, `_stamp`, `_latest`,
-      `_baseline`
-    - `versions.py` — `VERSION_COL`, `VersionStats` (one aggregation over the previous
-      output), `_rows_per_version` (only for the mixed-versions error)
-    - `schema.py` — `check_schema` (names + types, nullability ignored)
-    - `decorators.py` — `_migrated_one` (body of `Migrations.migrated`) and the
-      module-level multi-output `migrated({...})` with its TypedDict return check
-  - `foundry/` — everything that touches a Foundry output
-    - `protocols.py` — `TransformOutput` Protocol (the parts of Foundry's output the library
-      calls; `transforms.api` isn't available locally), `WriteOptions`
-    - `prepared.py` — `PreparedOutput` (returned by `prepare`): `write`, `previous`, `rewrite`
-    - `checks.py` — `VERSION_CHECK`: Foundry `Check(E.col(VERSION_COL).non_null(), ..., on_error="FAIL")`
-      for `Output(..., checks=[VERSION_CHECK])`; catches writes that bypass the library.
-      Needs Foundry's `transforms`, so the package loads it lazily via module
-      `__getattr__` (the package still imports locally). Untested with the real API.
-  - `core/migrations.py` imports from `foundry/` (`prepare`/`migrated` are methods);
-    `foundry/prepared.py` and `core/decorators.py` import `Migrations` only under
-    TYPE_CHECKING, so there's no cycle.
+  copy this folder into their Foundry repo. Flat on purpose (was `core/` + `foundry/`
+  subpackages that imported each other; flattened for readability).
+  - `__init__.py` — re-exports the public names; lazy `VERSION_CHECK` via module `__getattr__`
+  - `errors.py` — `MigrationError` base + `ConfigError` (import time), `DataStateError`
+    (previous output can't be migrated), `MigrationFailedError`, `SchemaMismatchError`,
+    `UsageError`. Situations are classmethod constructors (`DataStateError.mixed_versions(...)`)
+    that build the message; no per-situation classes (was 14, nobody read their attributes).
+  - `schema.py` — `VERSION_COL`, `check_schema` (names + types, nullability and version
+    column ignored on both sides; `where=`/`hint=` only label the error)
+  - `migrations.py` — `Migration` (one change; runs itself via `_apply`) and `Migrations`
+    (the chain): public `prepare`, `dry_run`, `checks`; private `_current_version`
+    (the one aggregation, formerly `VersionStats`), `_upgrade`, `_latest`, `_baseline`
+  - `prepared.py` — `PreparedOutput` (returned by `prepare`): `write`, `previous`, `rewrite`,
+    `plan_write`, `plan_rewrite` (return a `PlannedWrite(df, mode)` for native writes);
+    also `TransformOutput` Protocol (`transforms.api` isn't available locally),
+    `WriteOptions`, write-mode constants, `_stamp`. Doesn't import `Migrations` (gets `latest`).
+  - `decorator.py` — `migrated(m, mode=)` / `migrated({output: Migrations}, mode=)`
+    (overloads): the only decorator; `MigratedOutput` (the stand-in for each output the
+    function gets); `Mode = Literal["append", "rewrite"]`
+  - `checks.py` — `VERSION_CHECK`: Foundry `Check(E.col(VERSION_COL).non_null(), ..., on_error="FAIL")`
+    for `Output(..., checks=[VERSION_CHECK])`; catches writes that bypass the library.
+    Needs Foundry's `transforms`, so loaded lazily. Untested with the real API.
 - `tests/test_schema_migrations.py` — pytest suite, runs on local Spark with fake Foundry objects
 - `pyproject.toml` — pytest config (repo root on the path, `tests/` as test path)
 - `README.md` — user-facing docs
@@ -56,16 +52,44 @@ uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python "pyspark==3.5.3" pyt
     data newer than code, data older than baseline. Per-version breakdown only on error.
   - `prepare(out)` → `PreparedOutput`: reads previous, checks versions, plans migrations
     BEFORE business logic (user asked for fail-fast, incl. multi-output transforms). The
-    handle's `write(new_rows)` / `previous(schema)` + `rewrite(all_rows)` reuse that check. The decorator
-    prepares before calling the function. `prepare` is THE way without a decorator: the
-    `m.write`/`m.rewrite` shortcuts were removed because they checked only after the
-    business logic ran.
-  - module-level `migrated({"orders": m1, "items": m2}, previous_schemas=, write_options=)` —
-    several outputs; prepares all before the function, which returns {output: new rows};
-    validates the dict (`ReturnedOutputsError`) before writing any output. The function's
-    return annotation must be a TypedDict with exactly those fields, all `DataFrame`
-    (`ReturnAnnotationError` at import; resolved with `get_type_hints`, so the TypedDict
-    must be at module level).
+    handle's `write(new_rows)` / `previous(schema)` + `rewrite(all_rows)` reuse that check.
+  - **Entry points**: `@migrated({...}, mode=...)`, and `m.prepare(out)` + `write` /
+    `previous` + `rewrite` / `plan_*` without a decorator. The former `m.migrated()`
+    method (same name as the module function, different shape) was removed.
+  - **`mode=` is required, keyword-only, no default** (user chose it; lib not used yet, so
+    breaking was fine). It says what the function returns: `"append"` = new rows
+    (`PreparedOutput.write`), `"rewrite"` = all rows, replace every run
+    (`PreparedOutput.rewrite`). Reason: the user found `@migrated` didn't say "new rows";
+    returning all rows in append mode silently duplicates. Replaced a separate
+    `@rewrites(m)` decorator. Dict form: one mode, or output name -> mode (keys checked at
+    import). Rejected: per-run choice via returning `Append(df)`/`Rewrite(df)` markers
+    (breaks the TypedDict return check).
+  - The function gets a `MigratedOutput` in place of each migrated output (both modes):
+    `previous(schema)`; `write_dataframe`/`dataframe`/`set_mode` raise `UsageError`
+    immediately. Returns are still type-checked (DataFrame / TypedDict). Several outputs:
+    all are planned (schema-checked) before any is written. Decorated transform is typed
+    `Callable[..., None]`: a ParamSpec can't swap one parameter's type.
+    Rejected alternatives for reconcile: injecting a `previous` parameter (Foundry maps
+    parameters by name; first run needs a schema) and a merge callback.
+  - `plan_write(new_rows)` / `plan_rewrite(all_rows)` → `PlannedWrite(df, mode)`: what
+    `write`/`rewrite` would do, for users who call `out.write_dataframe` themselves (user
+    asked). `write`/`rewrite` are built on them. The library still decides the mode:
+    `VERSION_CHECK` catches an unstamped write but not a wrong mode (appending a planned
+    replace duplicates rows silently), which is why writing wasn't removed from the library.
+  - `migrated(m, mode=, write_options=)` / `migrated({"orders": m1, "items": m2}, mode=, write_options=)` —
+    decorator placed directly above `def`, below `@transform`; prepares the outputs before
+    the function. `migrated(m)`: the transform must have exactly one output (found at run
+    time as the argument with `write_dataframe`) and the function returns a DataFrame
+    (user asked for this shorthand). Dict form (even with one entry): the function returns a
+    dict validated (`UsageError`) before writing any output, and its return annotation must
+    be a TypedDict with exactly those fields, all `DataFrame` (`UsageError` at import;
+    resolved with `get_type_hints`, so the TypedDict must be at module level). User wants
+    to keep this annotation check.
+  - No `previous_schema` argument (removed): Foundry's `dataframe("previous", schema=)`
+    only uses it for the empty frame when there's no previous output, and the library
+    handles that case itself. Can't derive it from the input dataset (different schema;
+    previous is read before business logic). If Foundry turns out to require it, pass
+    `T.StructType([])` internally.
   - `PreparedOutput.previous(schema)` + `rewrite(all_rows)` — for reconcile-then-replace
     transforms: `previous` returns the migrated previous rows checked against `schema`,
     WITHOUT the version column (empty with those columns on the first run); `rewrite`
@@ -73,16 +97,13 @@ uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python "pyspark==3.5.3" pyt
     chose to drop the version column from `previous` despite the risk: writing the result
     with `out.write_dataframe` instead of `rewrite` leaves the output unversioned and the
     next run re-applies every migration (silent corruption, reproduced). Documented.
-  - `PreparedOutput._resolve(new_rows)` → `(df, WriteMode)`.
   - `PreparedOutput.write(new_rows, write_options=None)` — appends, or replaces after a
-    migration.
-  - `@m.migrated()` — decorator placed directly above `def`, below `@transform`: prepares,
-    calls the function (which RETURNS new rows), then `PreparedOutput.write`.
+    migration (also on the first run and for snapshot outputs).
   - `Migration(..., checks=[...])` — Foundry `Check`s valid from that version on;
     `Migrations.checks` lists the kept migrations' checks, oldest first, for
     `Output(..., checks=[VERSION_CHECK, *m.checks])`. `VERSION_CHECK` isn't included, so
-    `core/` never imports `transforms`. Typed `object` (Check isn't available locally).
-  - `dry_run(spark, baseline_schema, expected)` — unit-test aid, runs chain on empty frame.
+    only `checks.py` imports `transforms`. Typed `object` (Check isn't available locally).
+- `dry_run(spark, baseline_schema, expected)` — unit-test aid, runs chain on empty frame.
 
 ## Design decisions (agreed with the user — keep them)
 
@@ -134,10 +155,10 @@ uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python "pyspark==3.5.3" pyt
 
 ## Not yet verified in Foundry (tested only with fakes)
 
-1. `@m.migrated()` below `@transform` still lets Foundry map `src`/`out` by parameter name
+1. `@migrated(...)` below `@transform` still lets Foundry map `src`/`out` by parameter name
    (uses `functools.wraps`, signature preserved).
 2. `out.dataframe("previous")` returns the stored (old) schema after a schema change, and
-   how its `schema=` argument behaves when it differs (decorator has `previous_schema=`).
+   works without `schema=` (incl. the first run of a new dataset).
 3. `require_incremental=True` allows the first run of a brand-new dataset.
 4. Whether Foundry's Spark uses the V2 parquet reader, so
    `spark.sql.parquet.aggregatePushdown=true` shows `PushedAggregation` in the plan.

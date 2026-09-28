@@ -1,28 +1,32 @@
-"""Schema comparison by column names and types, ignoring nullability."""
+"""Schema comparison by column names and types, ignoring nullability and the version column."""
 from pyspark.sql import DataFrame
 from pyspark.sql import types as T
 
-from ..enums import CheckedData
-from ..exceptions import SchemaMismatchError
-from .versions import VERSION_COL
+from .errors import SchemaMismatchError
+
+VERSION_COL = "_schema_version"
 
 
-def check_schema(df: DataFrame, schema: T.StructType,
-                 checked: CheckedData = CheckedData.DATAFRAME) -> DataFrame:
+def check_schema(df: DataFrame, schema: T.StructType, *, where: str = "dataframe",
+                 hint: str = "") -> DataFrame:
     """Raise unless df has exactly the columns and types of `schema`, ignoring the version
-    column. Never casts. Returns df with only schema's columns, in its order."""
+    column on both sides. Never casts. Returns df with only schema's columns, in its order.
+
+    where, hint: name the checked data in the error message, and add a hint to it."""
+    wanted_schema = _without_version(schema)
     actual = _column_types(_without_version(df.schema))
-    wanted = _column_types(schema)
+    wanted = _column_types(wanted_schema)
     missing = sorted(wanted.keys() - actual.keys())
     extra = sorted(actual.keys() - wanted.keys())
     wrong = sorted(f"{col}: {actual[col].simpleString()} (expected {wanted[col].simpleString()})"
                    for col in actual.keys() & wanted.keys() if actual[col] != wanted[col])
     if missing or extra or wrong:
-        raise SchemaMismatchError(checked, missing, extra, wrong)
-    return df.select(*schema.fieldNames())
+        raise SchemaMismatchError(where, missing, extra, wrong, hint)
+    return df.select(*wanted_schema.fieldNames())
 
 
 def _without_version(schema: T.StructType) -> T.StructType:
+    """Version column matched case-insensitively, like Spark does."""
     return T.StructType(
         [field for field in schema.fields if field.name.lower() != VERSION_COL]
     )

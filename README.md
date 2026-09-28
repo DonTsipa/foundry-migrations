@@ -4,9 +4,9 @@ Versioned (Alembic-style) schema migrations for incremental Foundry PySpark tran
 Python 3.12+. Copy the `schema_migrations/` folder into your repository's package.
 
 Each row carries `_schema_version`. If the previous output is behind, the pending
-migrations run on it and the output is rewritten once; otherwise new rows are appended.
-The previous output, migrated or not, must match the new rows' schema, which catches
-broken migrations and schema changes made without one.
+migrations run on it before your transform sees it. The previous output, migrated or not,
+must match the new rows' schema, which catches broken migrations and schema changes made
+without one.
 
 ```python
 m = Migrations([
@@ -16,10 +16,19 @@ m = Migrations([
 
 @incremental(require_incremental=True)
 @transform(out=Output(..., checks=[VERSION_CHECK]), src=Input(...))
-@m.migrated()                                  # innermost
+@migrated(m, mode="append")                    # innermost
 def compute(src, out):
     return business_logic(src.dataframe())     # return new rows, don't write
 ```
+
+`mode` says what the function returns:
+
+- `mode="append"`: **new rows**. They're appended; after a migration (and on the first
+  run) the output is replaced with the migrated previous rows plus the new rows.
+- `mode="rewrite"`: **all rows**. They replace the output every run. For transforms that
+  reconcile the previous output with new rows (upserts, dedup) or recompute everything.
+
+Returning all rows with `mode="append"` duplicates the previous rows, and no check notices.
 
 `VERSION_CHECK` (`from myproject.schema_migrations import VERSION_CHECK`) fails the build
 if any row is written without `_schema_version`, e.g. by `out.write_dataframe` instead of
@@ -77,18 +86,27 @@ With `on_error="WARN"` a forgotten contradicted check only warns.
 
 ## Use cases
 
-Without a decorator, `prepare` every output first: it checks the previous output and
-plans the migrations before any business logic runs.
+In both modes the function gets a `MigratedOutput` in place of `out`:
+`out.previous(schema)` returns the migrated previous rows, without `_schema_version`
+(empty with `schema`'s columns on the first run). Calling `out.write_dataframe`,
+`out.dataframe` or `out.set_mode` raises `UsageError`: return the rows instead.
+
+Reconcile and replace every run:
 
 ```python
-def compute(src, out):
-    prepared = m.prepare(out)
-    prepared.write(business_logic(src.dataframe()))
+@incremental(require_incremental=True)
+@transform(out=Output(..., checks=[VERSION_CHECK]), src=Input(...))
+@migrated(m, mode="rewrite")
+def compute(src, out: MigratedOutput) -> DataFrame:
+    new_rows = business_logic(src.dataframe())
+    return reconcile(out.previous(new_rows.schema), new_rows)
 ```
 
-Several outputs, one migration list each; every output is checked before the function
-runs. The return type must be a TypedDict naming exactly the migrated outputs (checked at
-import, and by your type checker):
+Several outputs (or one migrated output among several): pass a dict of output parameter
+name → migration list; every output is checked before the function runs. `mode` is one
+mode for all outputs or a dict with a mode per output. The return type
+must be a TypedDict naming exactly the migrated outputs (checked at import, and by your
+type checker):
 
 ```python
 class Outputs(TypedDict):
@@ -101,24 +119,33 @@ class Outputs(TypedDict):
     items=Output(..., checks=[VERSION_CHECK]),
     src=Input(...),
 )
-@migrated({"orders": orders_m, "items": items_m})
+@migrated({"orders": orders_m, "items": items_m}, mode={"orders": "append", "items": "rewrite"})
 def compute(src, orders, items) -> Outputs:
     df = business_logic(src.dataframe())
     return {"orders": to_orders(df), "items": to_items(df)}
 ```
 
-Reconcile and `replace` every run (upserts, dedup): take the migrated previous rows,
-combine them with the new ones, and write everything with `rewrite`.
+`write_options=` passes extra arguments to `out.write_dataframe`:
+`@migrated(m, mode="append", write_options={"partition_cols": ["date"]})`, or per output
+name with the dict form.
+
+Writing yourself (no decorator, e.g. native `out.write_dataframe` calls): `prepare` the output first
+(it checks the previous output and plans the migrations before any business logic runs),
+then ask for the planned write and make it with **both** `set_mode` and `write_dataframe`:
 
 ```python
 prepared = m.prepare(out)
 new_rows = business_logic(src.dataframe())
-previous = prepared.previous(new_rows.schema)      # migrated; empty with these columns on the first run
-prepared.rewrite(reconcile(previous, new_rows))    # stamped, written with replace
+plan = prepared.plan_write(new_rows)                # like mode="append"; or like mode="rewrite":
+# plan = prepared.plan_rewrite(reconcile(prepared.previous(new_rows.schema), new_rows))
+out.set_mode(plan.mode)                             # "modify" or "replace"; incremental outputs only
+out.write_dataframe(plan.df, ...)                   # plan.df is stamped with _schema_version
 ```
 
-Always write it with `rewrite`, not `out.write_dataframe`: an output without
-`_schema_version` makes the next run re-apply every migration.
+Write `plan.df`, not a frame of your own: an output without `_schema_version` makes the
+next run re-apply every migration (`VERSION_CHECK` fails that build). Don't skip
+`set_mode`: appending a planned `replace` duplicates the previous rows, and no check
+notices. `prepared.write(new_rows)` / `prepared.rewrite(all_rows)` do both steps for you.
 
 Unit test without data: `m.dry_run(spark, BASELINE_SCHEMA, expected=LATEST_SCHEMA)`.
 
@@ -136,7 +163,10 @@ Int → struct: `cast()` can't do it; build with `F.struct` and keep nulls as nu
 
 ## What fails the build
 
-Anything unexpected raises a `MigrationError` subclass before anything is written.
+Anything unexpected raises a `MigrationError` before anything is written:
+`ConfigError` (bad migration list, at import), `DataStateError` (previous output can't be
+migrated), `MigrationFailedError`, `SchemaMismatchError`, `UsageError` (library called the
+wrong way).
 
 Not caught: a `cast` that silently turns bad values into null; errors that happen only
 while writing (e.g. in a UDF) don't name the migration.
@@ -152,8 +182,9 @@ while writing (e.g. in a UDF) don't name the migration.
 
 ## Verify in Foundry (tested locally with fakes only)
 
-1. `@m.migrated()` below `@transform` still lets Foundry map `src`/`out` by name.
-2. `out.dataframe("previous")` returns the stored (old) schema after a schema change.
+1. `@migrated(...)` below `@transform` still lets Foundry map `src`/`out` by name.
+2. `out.dataframe("previous")` returns the stored (old) schema after a schema change, and
+   works without a `schema=` argument (on the first run too).
 3. `require_incremental=True` allows the first run of a new dataset.
 4. Incremental builds continue after a dataset rollback.
 5. With several outputs, a build that fails after one output was written commits none.
