@@ -102,6 +102,16 @@ class UsageError(MigrationError):
         return cls(f"@migrated: '{fn_name}' has no parameters {missing} (it has {params})")
 
     @classmethod
+    def df_parameters(cls, fn_name: str, params: list[str], inputs: list[str], output: str) -> Self:
+        return cls(
+            f"@migrated_df: '{fn_name}' has parameters {params}; expected the inputs "
+            f"{inputs} (plus optional 'ctx'). No input may be called '{output}'.")
+
+    @classmethod
+    def not_migrations(cls, got: object) -> Self:
+        return cls(f"@migrated_df: the first argument must be a Migrations (got {type(got).__name__}).")
+
+    @classmethod
     def return_annotation(cls, fn_name: str, outputs: list[str], problem: str) -> Self:
         return cls(
             f"@migrated: '{fn_name}' must be annotated to return a TypedDict with exactly the "

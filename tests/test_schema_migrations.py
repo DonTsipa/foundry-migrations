@@ -1,4 +1,5 @@
 import inspect
+import types
 from collections.abc import Iterator
 from typing import Any, TypedDict
 import os
@@ -9,7 +10,7 @@ from pyspark.sql import DataFrame, SparkSession, functions as F, types as T
 
 from schema_migrations import (
     VERSION_COL, ConfigError, DataStateError, Migration, MigrationError, MigrationFailedError, Migrations,
-    PreparedOutput, SchemaMismatchError, UsageError, migrated, MigratedOutput,
+    PreparedOutput, SchemaMismatchError, UsageError, migrated, migrated_df, MigratedOutput,
 )
 
 V0 = T.StructType([T.StructField("id", T.StringType()), T.StructField("amt", T.IntegerType())])
@@ -78,7 +79,22 @@ def prepare(migrations: Migrations, prev: DataFrame) -> PreparedOutput:
 
 # ---------- configuration ----------
 
-def test_bad_configuration_fails_at_import() -> None:
+def fake_transforms(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Stand-in for Foundry's `transforms` package: Check(...), E.col(...) and transform(...) as tuples/namespaces."""
+    api, expectations = types.ModuleType("transforms.api"), types.ModuleType("transforms.expectations")
+    api.Check = lambda *args, **kwargs: ("Check", args, kwargs)  # type: ignore[attr-defined]
+    api.transform = lambda **ios: lambda fn: types.SimpleNamespace(ios=ios, compute=fn)  # type: ignore[attr-defined]
+    expectations.col = lambda name: types.SimpleNamespace(  # type: ignore[attr-defined]
+        non_null=lambda: ("non_null", name), equals=lambda value: ("equals", name, value))
+    expectations.all = lambda *parts: ("all", *parts)  # type: ignore[attr-defined]
+    package = types.ModuleType("transforms")
+    package.api, package.expectations = api, expectations  # type: ignore[attr-defined]
+    for name, module in [("transforms", package), ("transforms.api", api), ("transforms.expectations", expectations)]:
+        monkeypatch.setitem(sys.modules, name, module)
+    monkeypatch.delitem(sys.modules, "schema_migrations.checks", raising=False)
+
+
+def test_bad_configuration_fails_at_import(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(ConfigError, match=">= 1"):
         Migration(0, "x", lambda df: df)
     with pytest.raises(ConfigError, match="used twice"):
@@ -89,7 +105,10 @@ def test_bad_configuration_fails_at_import() -> None:
     amount_check, status_check = object(), object()                            # stand-ins for Foundry Checks
     with_checks = Migrations([Migration(1, "rename amt", M1.upgrade, checks=[amount_check]), M2,
                               Migration(3, "add status", M3.upgrade, checks=[status_check])])
-    assert with_checks.checks == [amount_check, status_check] and m().checks == []
+    fake_transforms(monkeypatch)
+    version_3 = ("Check", (("all", ("non_null", VERSION_COL), ("equals", VERSION_COL, 3)),
+                           "Every row has schema version 3"), {"on_error": "FAIL"})
+    assert with_checks.checks == [version_3, amount_check, status_check] and m().checks == [version_3]
 
 
 # ---------- versions ----------
@@ -112,6 +131,12 @@ def test_write_modes(spark: SparkSession) -> None:
     assert appended.columns == ["id", "amount", "status", VERSION_COL]          # stored column order
     plan = prepare(m(), up_to_date).plan_write(reordered)                       # for a native write
     assert plan.mode == "modify" and plan.df.columns == appended.columns
+
+    # adopting with no migrations: unversioned rows are rewritten once, stamped 0
+    unversioned = new(spark, ("a", 1.0, "s"))
+    adopted, mode = resolve(Migrations([]), unversioned, new(spark, ("b", 2.0, "t")))
+    assert mode == "replace" and rows(adopted) == [("a", 1.0, "s", 0), ("b", 2.0, "t", 0)]
+    assert resolve(Migrations([]), adopted, new(spark, ("c", 3.0, "u")))[1] == "modify"  # then appends
 
 
 def test_bad_previous_output_fails(spark: SparkSession) -> None:
@@ -293,3 +318,35 @@ def test_several_outputs(spark: SparkSession) -> None:
         return {"orders": src.dataframe()}  # type: ignore[typeddict-item]
     with pytest.raises(UsageError, match="must return"):              # at run time
         forgets_items(src=FakeInput(new(spark)), orders=FakeOutput(spark), items=FakeOutput(spark))
+
+
+def test_transform_df(spark: SparkSession, monkeypatch: pytest.MonkeyPatch) -> None:
+    fake_transforms(monkeypatch)
+
+    @migrated_df(m(), "Output(...)", mode="append", src="Input(...)")
+    def compute(src: DataFrame, ctx: object) -> DataFrame:
+        assert ctx == "ctx"                                                # passed through
+        return src
+    assert compute.ios == {"output": "Output(...)", "src": "Input(...)"}   # a @transform(output=..., src=...)
+    assert list(inspect.signature(compute.compute).parameters) == ["src", "ctx", "output"]
+
+    out = FakeOutput(spark, stored=spark.createDataFrame([("a", 5)], V0))       # migration pending
+    compute.compute(src=FakeInput(new(spark, ("b", 2.0, "t"))), ctx="ctx", output=out)
+    assert out.mode == "replace" and rows(out.written) == [("a", 5.0, None, 3), ("b", 2.0, "t", 3)]
+    up_to_date = FakeOutput(spark, stored=stamped(new(spark, ("a", 1.0, "s"))))
+    compute.compute(FakeInput(new(spark, ("b", 2.0, "t"))), "ctx", up_to_date)   # positional
+    assert up_to_date.mode == "modify" and rows(up_to_date.written) == [("b", 2.0, "t", 3)]
+
+    @migrated_df(m(), "Output(...)", mode="rewrite", src="Input(...)")
+    def rewrites(src: DataFrame) -> DataFrame:
+        return src
+    replaced = FakeOutput(spark, stored=stamped(new(spark, ("a", 1.0, "s"))))
+    rewrites.compute(src=FakeInput(new(spark, ("b", 2.0, "t"))), output=replaced)
+    assert replaced.mode == "replace" and rows(replaced.written) == [("b", 2.0, "t", 3)]
+
+    with pytest.raises(UsageError, match="expected the inputs"):                  # at import
+        migrated_df(m(), "Output(...)", mode="append", src="Input(...)")(lambda other: other)
+    with pytest.raises(UsageError, match="must be a Migrations"):
+        migrated_df("m", "Output(...)", mode="append", src="Input(...)")  # type: ignore[arg-type]
+    with pytest.raises(UsageError, match="mode must be"):
+        migrated_df(m(), "Output(...)", mode="replace", src="Input(...)")  # type: ignore[arg-type]

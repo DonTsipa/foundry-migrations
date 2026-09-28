@@ -55,13 +55,15 @@ class Migrations:
 
     @property
     def checks(self) -> list[object]:
-        """Foundry `Check`s of all kept migrations, oldest first, for
-        `Output(..., checks=[VERSION_CHECK, *m.checks])`."""
-        return [
+        """For `Output(..., checks=m.checks)`: the version check (every row at the latest
+        version), then the Foundry `Check`s of all kept migrations, oldest first."""
+        from .checks import version_check  # needs Foundry's `transforms`
+
+        return [version_check(self._latest), *(
             check
             for version in sorted(self._by_version)
             for check in self._by_version[version].checks
-        ]
+        )]
 
     def prepare(self, out: TransformOutput) -> PreparedOutput:
         """Check the previous output of `out` now and plan its pending migrations, before
@@ -71,11 +73,13 @@ class Migrations:
         if not _is_incremental(out):  # snapshot output: nothing to migrate
             return PreparedOutput(out, self._latest, previous_rows=None, pending=False)
         stored = out.dataframe("previous")
-        current = self._current_version(stored)
-        if current is None:
+        found = self._current_version(stored)
+        if found is None:
             return PreparedOutput(out, self._latest, previous_rows=None, pending=False)
+        current, stamped = found
+        # unstamped rows are rewritten even with nothing to migrate, to stamp them
         return PreparedOutput(out, self._latest, previous_rows=self._upgrade(stored, current),
-                              pending=current < self._latest)
+                              pending=current < self._latest or not stamped)
 
     def dry_run(
         self,
@@ -90,13 +94,13 @@ class Migrations:
             df = check_schema(df, expected, where="dry run result")
         return df.schema
 
-    def _current_version(self, prev: DataFrame) -> int | None:
-        """Version of every row in `prev`: None if empty, 0 if unversioned. Raises unless the
-        rows can be migrated to the latest version. One aggregation without a shuffle; with
+    def _current_version(self, prev: DataFrame) -> tuple[int, bool] | None:
+        """(version of every row in `prev`, whether they're stamped): None if empty, (0, False)
+        if unversioned. Raises unless the rows can be migrated to the latest version. One aggregation without a shuffle; with
         spark.sql.parquet.aggregatePushdown=true it is read from parquet footers."""
         match _version_type(prev):
             case None:
-                return 0 if prev.count() else None
+                return (0, False) if prev.count() else None
             case T.IntegralType():
                 pass
             case other:
@@ -111,13 +115,13 @@ class Migrations:
             return None
         if versioned and (versioned < total or low != high):
             raise DataStateError.mixed_versions(_rows_per_version(prev), self._latest)
-        version: int = low if versioned else 0
+        version: int = low if versioned else 0  # all null counts as unversioned
         if version > self._latest:
             raise DataStateError.newer_than_code(version, self._latest)
         if version < self._baseline:
             raise DataStateError.older_than_baseline(
                 version, self._baseline, self._by_version.get(self._baseline + 1))
-        return version
+        return version, bool(versioned)
 
     def _upgrade(self, prev: DataFrame, current: int) -> DataFrame:
         """prev with the migrations after `current` applied (planned; Spark runs them on write)."""

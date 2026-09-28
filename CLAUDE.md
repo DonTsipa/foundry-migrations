@@ -9,7 +9,7 @@ and open questions so work can continue without the original conversation.
 - `schema_migrations/` — the library package (PySpark only, Python 3.12 syntax). Users
   copy this folder into their Foundry repo. Flat on purpose (was `core/` + `foundry/`
   subpackages that imported each other; flattened for readability).
-  - `__init__.py` — re-exports the public names; lazy `VERSION_CHECK` via module `__getattr__`
+  - `__init__.py` — re-exports the public names
   - `errors.py` — `MigrationError` base + `ConfigError` (import time), `DataStateError`
     (previous output can't be migrated), `MigrationFailedError`, `SchemaMismatchError`,
     `UsageError`. Situations are classmethod constructors (`DataStateError.mixed_versions(...)`)
@@ -24,11 +24,19 @@ and open questions so work can continue without the original conversation.
     also `TransformOutput` Protocol (`transforms.api` isn't available locally),
     `WriteOptions`, write-mode constants, `_stamp`. Doesn't import `Migrations` (gets `latest`).
   - `decorator.py` — `migrated(m, mode=)` / `migrated({output: Migrations}, mode=)`
-    (overloads): the only decorator; `MigratedOutput` (the stand-in for each output the
-    function gets); `Mode = Literal["append", "rewrite"]`
-  - `checks.py` — `VERSION_CHECK`: Foundry `Check(E.col(VERSION_COL).non_null(), ..., on_error="FAIL")`
-    for `Output(..., checks=[VERSION_CHECK])`; catches writes that bypass the library.
-    Needs Foundry's `transforms`, so loaded lazily. Untested with the real API.
+    (overloads); `migrated_df(m, Output, mode=, write_options=, **inputs)`: a drop-in for
+    `@transform_df` (which never passes the output to the function, so it can't be
+    wrapped). Builds `transform(output=..., **inputs)` + `migrated(m, mode=)` around a
+    generated `compute` whose `__signature__` is the function's params (inputs, optional
+    `ctx`) + `output`; imports `transforms.api` lazily. Ported from the `nativeWrite`
+    branch. `MigratedOutput` (the stand-in for each output the function gets);
+    `Mode = Literal["append", "rewrite"]`
+  - `checks.py` — `version_check(latest)`: Foundry `Check(E.all(E.col(VERSION_COL).non_null(),
+    E.col(VERSION_COL).equals(latest)), ..., on_error="FAIL")`, first in `m.checks`. Every
+    row must be at the latest version (was only non_null, as `VERSION_CHECK`): catches
+    writes that bypass the library AND writes by older code. Per chain, so no module-level
+    constant / `VERSION_CHECK` export. Needs Foundry's `transforms`, so imported inside the
+    `checks` property. Untested with the real API (fake module).
 - `tests/test_schema_migrations.py` — pytest suite, runs on local Spark with fake Foundry objects
 - `pyproject.toml` — pytest config (repo root on the path, `tests/` as test path)
 - `README.md` — user-facing docs
@@ -74,7 +82,7 @@ uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python "pyspark==3.5.3" pyt
   - `plan_write(new_rows)` / `plan_rewrite(all_rows)` → `PlannedWrite(df, mode)`: what
     `write`/`rewrite` would do, for users who call `out.write_dataframe` themselves (user
     asked). `write`/`rewrite` are built on them. The library still decides the mode:
-    `VERSION_CHECK` catches an unstamped write but not a wrong mode (appending a planned
+    The version check catches an unstamped write but not a wrong mode (appending a planned
     replace duplicates rows silently), which is why writing wasn't removed from the library.
   - `migrated(m, mode=, write_options=)` / `migrated({"orders": m1, "items": m2}, mode=, write_options=)` —
     decorator placed directly above `def`, below `@transform`; prepares the outputs before
@@ -100,9 +108,9 @@ uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python "pyspark==3.5.3" pyt
   - `PreparedOutput.write(new_rows, write_options=None)` — appends, or replaces after a
     migration (also on the first run and for snapshot outputs).
   - `Migration(..., checks=[...])` — Foundry `Check`s valid from that version on;
-    `Migrations.checks` lists the kept migrations' checks, oldest first, for
-    `Output(..., checks=[VERSION_CHECK, *m.checks])`. `VERSION_CHECK` isn't included, so
-    only `checks.py` imports `transforms`. Typed `object` (Check isn't available locally).
+    `Migrations.checks` = `[version_check(latest), *kept migrations' checks oldest first]`
+    for `Output(..., checks=m.checks)`. Imports `checks.py` (and so `transforms`) only
+    when read. Typed `object` (Check isn't available locally).
 - `dry_run(spark, baseline_schema, expected)` — unit-test aid, runs chain on empty frame.
 
 ## Design decisions (agreed with the user — keep them)
@@ -122,13 +130,17 @@ uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python "pyspark==3.5.3" pyt
    out-of-band write: API, notebook, old code), data newer than code, data older than
    baseline — all raise a `MigrationError` subclass before anything is written.
 7. Every migration rewrites the whole output (`replace`), so all rows share one version.
-8. **Few tests.** User found 65, then 18 too many; now 8, one per behaviour (related
+8. **Few tests.** User found 65, then 18 too many; now 9, one per behaviour (related
    cases are asserted inside the same test). Don't add a test per option/validation case;
    extend the matching test instead.
 9. **Version column handling**: no explicit `drop` in the library. Migrations see
    `_schema_version` (constant, since mixed versions are rejected); `check_schema` ignores
    it and returns only the schema's columns; `_stamp` overwrites it with `withColumn`.
-   Matched case-insensitively. Unversioned data never leaves the library unstamped.
+   Matched case-insensitively. Unversioned data never leaves the library unstamped:
+   `_current_version` returns `(version, stamped)`, and unstamped rows (no column, or all
+   null) count as pending even with `Migrations([])`, so the first write rewrites them
+   stamped 0 (before, new stamped rows were appended next to unstamped ones and the next
+   build failed with mixed versions).
 
 10. **Adding a column (preferred pattern, documented in README):** `withColumn` silently
     overwrites an existing column and the schema check can't see it, so "add column"
@@ -164,10 +176,13 @@ uv venv -p 3.12 .venv && uv pip install -p .venv/bin/python "pyspark==3.5.3" pyt
    `spark.sql.parquet.aggregatePushdown=true` shows `PushedAggregation` in the plan.
 5. After rolling a dataset back to an earlier transaction (the recovery advised in the
    mixed-versions error), the next incremental build still runs incrementally.
-6. `VERSION_CHECK`: Foundry's `Check` / `E.col(...).non_null()` API names, and that a
+6. The version check: Foundry's `Check` / `E.all` / `E.col(...).non_null()` / `.equals()`
+   API names, and that a
    FAIL check aborts the transaction (tested only with a fake `transforms` module).
 7. Migration checks: what a Check on a column that no longer exists does (fails the build
    or is skipped), and whether checks on an incremental append see only the new rows.
+8. `@migrated_df`: Foundry maps parameters from the generated `__signature__` (incl. `ctx`),
+   and `@incremental` accepts the `transform(...)` result it returns.
 
 ## Background from the conversation
 

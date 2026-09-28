@@ -1,16 +1,17 @@
-"""Foundry data expectations. Needs Foundry's `transforms` package, so it's imported
-only when used (see `schema_migrations.__getattr__`)."""
+"""The version check. Imports Foundry's `transforms`, so it's loaded only when used
+(by `Migrations.checks`)."""
 
 from transforms import expectations as E  # type: ignore[import-not-found]
 from transforms.api import Check  # type: ignore[import-not-found]
 
 from .schema import VERSION_COL
 
-# Fails the build if an output is written without a version on every row, e.g. with
-# out.write_dataframe instead of the library. Add it to each migrated output:
-#   Output("/.../my_dataset", checks=[VERSION_CHECK])
-VERSION_CHECK = Check(
-    E.col(VERSION_COL).non_null(),
-    "Every row has a schema version",
-    on_error="FAIL",
-)
+
+def version_check(latest: int) -> object:
+    """Fails the build unless every row has version `latest`: catches rows written
+    without the library (no version) or by older code (lower version). In `m.checks`."""
+    return Check(
+        E.all(E.col(VERSION_COL).non_null(), E.col(VERSION_COL).equals(latest)),
+        f"Every row has schema version {latest}",
+        on_error="FAIL",
+    )

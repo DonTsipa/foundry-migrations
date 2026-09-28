@@ -15,7 +15,7 @@ m = Migrations([
 ])
 
 @incremental(require_incremental=True)
-@transform(out=Output(..., checks=[VERSION_CHECK]), src=Input(...))
+@transform(out=Output(..., checks=m.checks), src=Input(...))
 @migrated(m, mode="append")                    # innermost
 def compute(src, out):
     return business_logic(src.dataframe())     # return new rows, don't write
@@ -30,9 +30,12 @@ def compute(src, out):
 
 Returning all rows with `mode="append"` duplicates the previous rows, and no check notices.
 
-`VERSION_CHECK` (`from myproject.schema_migrations import VERSION_CHECK`) fails the build
-if any row is written without `_schema_version`, e.g. by `out.write_dataframe` instead of
-the library. Add it to every migrated output.
+`m.checks` starts with a version check: it fails the build unless every row has the latest
+`_schema_version`, which catches writes that bypass the library (e.g. `out.write_dataframe`)
+or come from older code. Add it to every migrated output.
+
+To adopt the library on an existing output you can start with `Migrations([])`: the
+existing rows are rewritten once with `_schema_version` 0, then builds append as usual.
 
 ## Adding a column
 
@@ -57,8 +60,8 @@ If the existing column has a different type, the build still fails on the schema
 
 ## Checks
 
-A migration can carry Foundry `Check`s that must hold from its version on. `m.checks`
-collects the checks of all kept migrations for the output:
+A migration can carry Foundry `Check`s that must hold from its version on. `m.checks` is
+the version check plus the checks of all kept migrations, oldest first:
 
 ```python
 AMOUNT_NOT_NULL = Check(E.col("amount").non_null(), "amount not null", on_error="FAIL")
@@ -67,7 +70,7 @@ m = Migrations([
     Migration(1, "rename amt to amount", rename_amt, checks=[AMOUNT_NOT_NULL]),
 ])
 
-@transform(out=Output(..., checks=[VERSION_CHECK, *m.checks]), src=Input(...))
+@transform(out=Output(..., checks=m.checks), src=Input(...))
 ```
 
 Foundry runs every check on every build, against the latest schema only. When a new
@@ -95,7 +98,7 @@ Reconcile and replace every run:
 
 ```python
 @incremental(require_incremental=True)
-@transform(out=Output(..., checks=[VERSION_CHECK]), src=Input(...))
+@transform(out=Output(..., checks=m.checks), src=Input(...))
 @migrated(m, mode="rewrite")
 def compute(src, out: MigratedOutput) -> DataFrame:
     new_rows = business_logic(src.dataframe())
@@ -115,8 +118,8 @@ class Outputs(TypedDict):
 
 @incremental(require_incremental=True)
 @transform(
-    orders=Output(..., checks=[VERSION_CHECK]),
-    items=Output(..., checks=[VERSION_CHECK]),
+    orders=Output(..., checks=orders_m.checks),
+    items=Output(..., checks=items_m.checks),
     src=Input(...),
 )
 @migrated({"orders": orders_m, "items": items_m}, mode={"orders": "append", "items": "rewrite"})
@@ -128,6 +131,17 @@ def compute(src, orders, items) -> Outputs:
 `write_options=` passes extra arguments to `out.write_dataframe`:
 `@migrated(m, mode="append", write_options={"partition_cols": ["date"]})`, or per output
 name with the dict form.
+
+`@transform_df` functions: use `@migrated_df(m, ..., mode=...)` instead, with the same
+arguments and body. `@transform_df` never passes the output to the function, so
+`@migrated` can't wrap it; `@migrated_df` builds the `@transform` for you.
+
+```python
+@incremental(require_incremental=True)
+@migrated_df(m, Output(..., checks=m.checks), mode="append", src=Input(...))   # was @transform_df(Output(...), src=Input(...))
+def compute(src: DataFrame) -> DataFrame:
+    return business_logic(src)
+```
 
 Writing yourself (no decorator, e.g. native `out.write_dataframe` calls): `prepare` the output first
 (it checks the previous output and plans the migrations before any business logic runs),
@@ -143,7 +157,7 @@ out.write_dataframe(plan.df, ...)                   # plan.df is stamped with _s
 ```
 
 Write `plan.df`, not a frame of your own: an output without `_schema_version` makes the
-next run re-apply every migration (`VERSION_CHECK` fails that build). Don't skip
+next run re-apply every migration (the version check fails that build). Don't skip
 `set_mode`: appending a planned `replace` duplicates the previous rows, and no check
 notices. `prepared.write(new_rows)` / `prepared.rewrite(all_rows)` do both steps for you.
 
@@ -189,4 +203,7 @@ while writing (e.g. in a UDF) don't name the migration.
 4. Incremental builds continue after a dataset rollback.
 5. With several outputs, a build that fails after one output was written commits none.
 6. `spark.sql.parquet.aggregatePushdown=true` shows `PushedAggregation` for the version check.
-7. `VERSION_CHECK` builds with Foundry's `Check` / `E.col(...).non_null()` API and fails the build.
+7. The version check builds with Foundry's `Check` / `E.all(...)` / `E.col(...).non_null()` /
+   `.equals(...)` API and fails the build.
+8. `@migrated_df`: Foundry maps parameters from the generated `__signature__` (including
+   `ctx`), and `@incremental` accepts the transform it builds.

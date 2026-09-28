@@ -1,5 +1,6 @@
-"""The @migrated decorator: prepares outputs before a transform runs and writes what it
-returns, appended or replacing the output (`mode=`)."""
+"""The @migrated decorator (for @transform) and @migrated_df (instead of @transform_df):
+prepare outputs before a transform runs and write what it returns, appended or replacing
+the output (`mode=`)."""
 
 import functools
 import inspect
@@ -163,6 +164,52 @@ def _only_output(fn_name: str, arguments: dict[str, object]) -> str:
     if len(outputs) != 1:
         raise UsageError.not_one_output(fn_name, outputs)
     return outputs[0]
+
+
+_OUTPUT = "output"  # the output's parameter name in the transform migrated_df builds
+
+
+def migrated_df(
+    migrations: Migrations,
+    output: object,
+    /,
+    *,
+    mode: Mode,
+    write_options: WriteOptions | None = None,
+    **inputs: object,
+) -> Callable[[Callable[..., DataFrame]], Any]:
+    """Use instead of @transform_df, with the same arguments plus `mode=` (see `migrated`).
+    The function gets the inputs' DataFrames (and `ctx` if it asks) and returns its rows.
+    (@transform_df can't be wrapped: it never passes the output to the function.)"""
+    if not isinstance(migrations, Migrations):
+        raise UsageError.not_migrations(migrations)
+    _check_modes({"": mode})
+
+    def decorator(fn: Callable[..., DataFrame]) -> Any:
+        from transforms.api import transform  # type: ignore[import-not-found]  # Foundry only
+
+        params = list(inspect.signature(fn).parameters)
+        if _OUTPUT in inputs or set(params) - {"ctx"} != set(inputs):
+            raise UsageError.df_parameters(fn.__name__, params, list(inputs), _OUTPUT)
+
+        # Foundry maps inputs, the output and ctx to parameters by name
+        signature = inspect.Signature(
+            [inspect.Parameter(name, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+             for name in [*params, _OUTPUT]])
+
+        def compute(*args: Any, **kwargs: Any) -> DataFrame:
+            arguments = signature.bind(*args, **kwargs).arguments
+            return fn(**{name: arguments[name].dataframe() if name in inputs else arguments[name]
+                         for name in params})
+
+        compute.__signature__ = signature  # type: ignore[attr-defined]
+        compute.__name__, compute.__qualname__, compute.__doc__ = (
+            fn.__name__, fn.__qualname__, fn.__doc__)
+        compute.__module__ = fn.__module__
+        wrapped = migrated(migrations, mode=mode, write_options=write_options)(compute)
+        return transform(**{_OUTPUT: output}, **inputs)(wrapped)
+
+    return decorator
 
 
 def _check_return_annotation(fn: Callable[..., object], outputs: list[str]) -> None:
